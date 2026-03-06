@@ -277,23 +277,41 @@ async function extractTextFromFile(file) {
 app.post('/api/upload', async (c) => {
   try {
     const form = await c.req.formData()
-    const file = form.get('file')
-    if (!file) return c.json({ error: 'No file' }, 400)
+    // Support both single 'file' and multiple 'files[]'
+    const singleFile = form.get('file')
+    const multiFiles = form.getAll('files[]')
+    const files = multiFiles.length > 0 ? multiFiles : (singleFile ? [singleFile] : [])
+    if (files.length === 0) return c.json({ error: 'No file' }, 400)
 
-    const name = file.name
-    const ext = name.split('.').pop()?.toLowerCase() || ''
     const supportedExts = ['html','htm','txt','md','csv','json','pdf','doc','docx','jpg','jpeg','png','gif','webp','bmp','tiff','svg']
-    if (!supportedExts.includes(ext)) {
-      return c.json({ error: `Unsupported file type: .${ext}. Supported: ${supportedExts.join(', ')}` }, 400)
+    
+    // Validate all files first
+    for (const f of files) {
+      const ext = f.name.split('.').pop()?.toLowerCase() || ''
+      if (!supportedExts.includes(ext)) {
+        return c.json({ error: `Unsupported file type: .${ext} (${f.name}). Supported: ${supportedExts.join(', ')}` }, 400)
+      }
     }
 
-    // Extract text based on file type
-    const extracted = await extractTextFromFile(file)
-    const plainText = extracted.text
-    const truncated = plainText.slice(0, 80000)
-
+    // Reset vector store and process all files
     vectorStore = []
-    currentDocName = name
+    const fileResults = []
+    let totalText = ''
+    
+    for (const file of files) {
+      const name = file.name
+      try {
+        const extracted = await extractTextFromFile(file)
+        const text = extracted.text.slice(0, Math.floor(80000 / files.length)) // distribute space evenly
+        totalText += (totalText ? '\n\n--- Document: ' + name + ' ---\n' : '') + text
+        fileResults.push({ name, size: file.size, type: extracted.type, chars: text.length, ok: true })
+      } catch (e) {
+        fileResults.push({ name, size: file.size, type: 'error', chars: 0, ok: false, error: e.message })
+      }
+    }
+
+    const truncated = totalText.slice(0, 80000)
+    currentDocName = files.length === 1 ? files[0].name : `${files.length} files`
     currentDocRaw = truncated
 
     const chunks = chunkText(truncated, 500, 100)
@@ -307,22 +325,26 @@ app.post('/api/upload', async (c) => {
           const batch = chunks.slice(i, i + batchSize)
           const embedRes = await llm.embeddings.create({ model: 'text-embedding-3-small', input: batch })
           batch.forEach((text, j) => {
-            vectorStore.push({ id: `chunk-${i+j}`, text, embedding: embedRes.data[j].embedding, metadata: { source: name, index: i+j } })
+            vectorStore.push({ id: `chunk-${i+j}`, text, embedding: embedRes.data[j].embedding, metadata: { source: currentDocName, index: i+j } })
           })
         }
         embeddingAvailable = true; usedEmbeddings = true
       } catch (e) {
         embeddingAvailable = false
-        chunks.forEach((text, i) => vectorStore.push({ id: `chunk-${i}`, text, embedding: null, metadata: { source: name, index: i } }))
+        chunks.forEach((text, i) => vectorStore.push({ id: `chunk-${i}`, text, embedding: null, metadata: { source: currentDocName, index: i } }))
       }
     } else {
-      chunks.forEach((text, i) => vectorStore.push({ id: `chunk-${i}`, text, embedding: null, metadata: { source: name, index: i } }))
+      chunks.forEach((text, i) => vectorStore.push({ id: `chunk-${i}`, text, embedding: null, metadata: { source: currentDocName, index: i } }))
     }
 
     return c.json({
-      name, size: file.size, chunks: vectorStore.length,
+      name: currentDocName,
+      fileCount: files.length,
+      files: fileResults,
+      totalSize: files.reduce((s, f) => s + f.size, 0),
+      chunks: vectorStore.length,
       chars: truncated.length,
-      fileType: extracted.type,
+      fileType: files.length === 1 ? fileResults[0]?.type : 'multi',
       searchMode: usedEmbeddings ? 'vector' : 'bm25'
     })
   } catch (err) {
@@ -650,6 +672,22 @@ html,body{height:100%;overflow:hidden;font-family:'Inter',sans-serif;background:
 .file-loaded-info{flex:1;min-width:0;}
 .file-loaded-name{font-size:.82rem;font-weight:700;color:var(--navy);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .file-loaded-meta{font-size:.69rem;color:var(--tt);margin-top:2px;}
+/* File list (batch mode) */
+.file-list{display:flex;flex-direction:column;gap:5px;max-height:160px;overflow-y:auto;padding:2px;}
+.file-item{display:flex;align-items:center;gap:8px;padding:7px 10px;background:var(--white);border:1px solid var(--border);border-radius:var(--r-md);transition:all var(--t);}
+.file-item.ok{border-color:rgba(16,185,129,.3);background:rgba(16,185,129,.03);}
+.file-item.err{border-color:rgba(239,68,68,.3);background:rgba(239,68,68,.03);}
+.file-item.processing{border-color:rgba(6,182,212,.4);background:rgba(6,182,212,.04);animation:pulse-border .8s infinite;}
+@keyframes pulse-border{0%,100%{border-color:rgba(6,182,212,.4)}50%{border-color:rgba(6,182,212,.9)}}
+.file-item-icon{font-size:14px;flex-shrink:0;}
+.file-item-name{flex:1;font-size:.78rem;font-weight:600;color:var(--navy);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.file-item-meta{font-size:.68rem;color:var(--tt);flex-shrink:0;}
+.file-item-status{width:16px;height:16px;border-radius:50%;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:10px;}
+.file-item-status.ok{background:rgba(16,185,129,.15);color:#059669;}
+.file-item-status.err{background:rgba(239,68,68,.15);color:#dc2626;}
+.file-item-status.pending{background:rgba(107,114,128,.1);color:#6b7280;}
+.file-item-status.spin{background:rgba(6,182,212,.1);color:#0e7490;animation:spin .7s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg)}}
 .file-remove{cursor:pointer;color:var(--tt);font-size:13px;padding:4px;border-radius:4px;transition:color var(--t);}
 .file-remove:hover{color:var(--red);}
 .vec-progress{background:var(--white);border:1px solid var(--border);border-radius:var(--r-xl);padding:18px;display:none;}
@@ -783,10 +821,11 @@ html,body{height:100%;overflow:hidden;font-family:'Inter',sans-serif;background:
     ondrop="handleDrop(event)">
     <input type="file" class="upload-input" id="fileInput"
       accept=".html,.htm,.txt,.md,.csv,.json,.pdf,.doc,.docx,.jpg,.jpeg,.png,.gif,.webp,.bmp"
+      multiple
       onchange="handleFileChange(event)"/>
     <div class="upload-icon"><i class="fas fa-cloud-upload-alt"></i></div>
-    <div class="upload-title">Upload Deal Memo or Document</div>
-    <div class="upload-sub">Drag & drop or click to select.<br>Supports PDF, DOCX, images, HTML, TXT, CSV, JSON — all automatically processed for AI analysis.</div>
+    <div class="upload-title">Upload Documents <span style="font-size:.75rem;font-weight:500;color:#06b6d4;background:rgba(6,182,212,.1);padding:2px 8px;border-radius:20px;margin-left:6px">Batch</span></div>
+    <div class="upload-sub">Drag & drop one or multiple files, or click to select.<br>Supports PDF, DOCX, images, HTML, TXT, CSV, JSON — all auto-processed.</div>
     <div class="upload-types">
       <span class="upload-type">.pdf</span>
       <span class="upload-type">.docx</span>
@@ -799,13 +838,14 @@ html,body{height:100%;overflow:hidden;font-family:'Inter',sans-serif;background:
     </div>
   </div>
   <div class="file-loaded" id="fileLoaded" style="display:none">
-    <div class="file-loaded-icon"><i class="fas fa-file-check"></i></div>
+    <div class="file-loaded-icon" id="fileLoadedIcon"><i class="fas fa-file-check"></i></div>
     <div class="file-loaded-info">
       <div class="file-loaded-name" id="loadedName">—</div>
       <div class="file-loaded-meta" id="loadedMeta">—</div>
     </div>
     <span class="file-remove" onclick="clearDoc()" title="Remove"><i class="fas fa-times-circle"></i></span>
   </div>
+  <div class="file-list" id="fileList" style="display:none"></div>
   <div class="vec-progress" id="vecProgress">
     <div class="vec-title"><i class="fas fa-microchip" style="color:#06b6d4"></i><span id="vecTitle">Processing…</span></div>
     <div class="vec-bar-track"><div class="vec-bar-fill" id="vecBar"></div></div>
@@ -956,46 +996,75 @@ async function saveApiKey(){
 }
 
 // ══════════════════════════════════════════════
-// FILE UPLOAD
+// FILE UPLOAD — BATCH + DRAG
 // ══════════════════════════════════════════════
+const ALLOWED_EXTS=['html','htm','txt','md','csv','json','pdf','doc','docx','jpg','jpeg','png','gif','webp','bmp'];
+
+function getFileIcon(ext){
+  if(ext==='pdf') return '📄';
+  if(['doc','docx'].includes(ext)) return '📝';
+  if(['jpg','jpeg','png','gif','webp','bmp'].includes(ext)) return '🖼️';
+  if(['csv','json'].includes(ext)) return '📊';
+  if(['html','htm'].includes(ext)) return '🌐';
+  return '📄';
+}
+function fmtSize(bytes){return bytes<1024?bytes+'B':bytes<1048576?(bytes/1024).toFixed(1)+'KB':(bytes/1048576).toFixed(1)+'MB';}
+
 function handleDrop(e){
   e.preventDefault();
   document.getElementById('uploadZone').classList.remove('drag');
-  const file=e.dataTransfer?.files?.[0];
-  if(file) processFile(file);
+  const files=Array.from(e.dataTransfer?.files||[]);
+  if(files.length>0) processFiles(files);
 }
 function handleFileChange(e){
-  const file=e.target.files?.[0];
-  if(file) processFile(file);
+  const files=Array.from(e.target.files||[]);
+  if(files.length>0) processFiles(files);
   e.target.value='';
 }
 
-async function processFile(file){
-  const allowed=['html','htm','txt','md','csv','json','pdf','doc','docx','jpg','jpeg','png','gif','webp','bmp'];
+async function processFiles(files){
+  // Filter supported
+  const valid=[],invalid=[];
+  for(const f of files){
+    const ext=f.name.split('.').pop()?.toLowerCase()||'';
+    if(ALLOWED_EXTS.includes(ext)) valid.push(f);
+    else invalid.push(f.name);
+  }
+  if(invalid.length>0) addMsg('bot',\`<p>⚠️ Skipped unsupported: <strong>\${invalid.join(', ')}</strong></p>\`);
+  if(valid.length===0) return;
+
+  // Single file → old-style progress; multi → queue list
+  if(valid.length===1){
+    await processSingleFile(valid[0]);
+  } else {
+    await processBatchFiles(valid);
+  }
+}
+
+/* ── Single file mode ─────────────────────── */
+async function processSingleFile(file){
   const ext=file.name.split('.').pop()?.toLowerCase()||'';
-  if(!allowed.includes(ext)){addMsg('bot','<p>⚠️ Unsupported: <strong>.'+ext+'</strong><br>Supported formats: PDF, DOCX, HTML, TXT, MD, CSV, JSON, Images (JPG/PNG/GIF/WEBP)</p>');return;}
+  const isImage=['jpg','jpeg','png','gif','webp','bmp'].includes(ext);
+  const isPdf=ext==='pdf';
+  const isDocx=['doc','docx'].includes(ext);
 
   const vp=document.getElementById('vecProgress');
   const bar=document.getElementById('vecBar');
   const status=document.getElementById('vecStatus');
   const title=document.getElementById('vecTitle');
   const chunksEl=document.getElementById('vecChunks');
+  const fileList=document.getElementById('fileList');
+  fileList.style.display='none';
 
   vp.classList.add('show'); bar.style.width='10%';
-  
-  // File-type specific messages
-  const isImage=['jpg','jpeg','png','gif','webp','bmp'].includes(ext);
-  const isPdf=ext==='pdf';
-  const isDocx=['doc','docx'].includes(ext);
-  
   title.textContent='Processing '+file.name+'…';
-  status.textContent=isPdf?'Parsing PDF…':isDocx?'Extracting DOCX…':isImage?'Analyzing image with AI…':'Uploading…';
+  status.textContent=isPdf?'Parsing PDF…':isDocx?'Extracting DOCX…':isImage?'Analyzing image…':'Uploading…';
   chunksEl.innerHTML='';
 
   const form=new FormData(); form.append('file',file);
   let prog=10;
   const pi=setInterval(()=>{prog=Math.min(prog+5,85);bar.style.width=prog+'%';
-    if(prog<30)status.textContent=isPdf?'Parsing PDF pages…':isDocx?'Parsing DOCX content…':isImage?'Sending to vision AI…':'Uploading…';
+    if(prog<30)status.textContent=isPdf?'Parsing PDF pages…':isDocx?'Parsing DOCX…':isImage?'Vision AI analyzing…':'Uploading…';
     else if(prog<55)status.textContent='Extracting text & structure…';
     else if(prog<75)status.textContent='Chunking & indexing…';
     else status.textContent='Building search index…';
@@ -1010,42 +1079,153 @@ async function processFile(file){
     const modeLabel=searchMode==='vector'?'Vector Embeddings':'BM25 Keyword';
     title.textContent='✅ Ready: '+data.name;
     status.textContent=data.chunks+' chunks · '+(data.chars/1000).toFixed(1)+'K chars · '+modeLabel;
-
-    chunksEl.innerHTML='';
-    const me=document.createElement('span');
-    me.className='vec-chunk';
-    me.style.background=searchMode==='vector'?'rgba(16,185,129,.1)':'rgba(245,158,11,.1)';
-    me.style.color=searchMode==='vector'?'#059669':'#b45309';
-    me.textContent=modeLabel+' Active';
-    chunksEl.appendChild(me);
-    const n=Math.min(data.chunks,10);
-    for(let i=0;i<n;i++){const s=document.createElement('span');s.className='vec-chunk';s.textContent='c'+i;chunksEl.appendChild(s);}
-    if(data.chunks>10){const s=document.createElement('span');s.className='vec-chunk';s.textContent='+'+( data.chunks-10);chunksEl.appendChild(s);}
-
-    docLoaded=true; docName=data.name;
-    document.getElementById('fileLoaded').style.display='flex';
-    document.getElementById('loadedName').textContent=data.name;
-    document.getElementById('loadedMeta').textContent=data.chunks+' chunks · '+Math.round(data.size/1024)+'KB · '+modeLabel;
-    document.getElementById('uploadZone').classList.add('has-file');
-    document.getElementById('aiCtxText').textContent=data.name.slice(0,18)+(data.name.length>18?'…':'');
-
+    renderChunkBadges(chunksEl,data.chunks,searchMode);
+    updateLoadedState(data.name,data.chunks+' chunks · '+fmtSize(data.totalSize||data.size||0)+' · '+modeLabel,data.fileType);
     removeIdle();
-    const ftIcon=data.fileType==='pdf'?'📄':data.fileType==='docx'?'📝':data.fileType==='image'?'🖼️':'📁';
-    const ftNote=data.fileType==='image'?'<li><strong>Image analyzed</strong> — AI vision extracted content & text</li>':data.fileType==='pdf'?'<li><strong>PDF parsed</strong> — text extracted from all pages</li>':data.fileType==='docx'?'<li><strong>DOCX parsed</strong> — document content extracted</li>':'';
-    addMsg('bot',\`<h4>\${ftIcon} Document Ready: \${data.name}</h4><p>Processed <strong>\${data.chunks} chunks</strong> using \${modeLabel}.</p><ul>\${ftNote}<li><strong>Ask questions</strong> — AI searches relevant passages</li><li><strong>Generate dashboards</strong> — enter a prompt on the left</li><li><strong>Quick chips</strong> — click Overview, Financials, etc.</li></ul>\`);
+    const ftIcon=getFileIcon(ext);
+    const ftNote=data.fileType==='image'?'<li>🖼️ <strong>Image analyzed</strong> via Vision AI</li>':data.fileType==='pdf'?'<li>📄 <strong>PDF parsed</strong> — all pages extracted</li>':data.fileType==='docx'?'<li>📝 <strong>DOCX parsed</strong> — content extracted</li>':'';
+    addMsg('bot',\`<h4>\${ftIcon} Ready: \${data.name}</h4><p>Processed <strong>\${data.chunks} chunks</strong> · \${modeLabel}.</p><ul>\${ftNote}<li>Ask questions in the chat panel</li><li>Generate dashboards with the left panel</li></ul>\`);
   }catch(err){
     clearInterval(pi); bar.style.width='0%'; vp.classList.remove('show');
     addMsg('bot','<p>❌ Failed: '+err.message+'</p>');
   }
 }
 
+/* ── Batch file mode ──────────────────────── */
+async function processBatchFiles(files){
+  const vp=document.getElementById('vecProgress');
+  const bar=document.getElementById('vecBar');
+  const status=document.getElementById('vecStatus');
+  const title=document.getElementById('vecTitle');
+  const chunksEl=document.getElementById('vecChunks');
+  const fileList=document.getElementById('fileList');
+
+  // Build queue UI
+  fileList.style.display='flex'; fileList.innerHTML='';
+  const itemEls=[];
+  for(const f of files){
+    const ext=f.name.split('.').pop()?.toLowerCase()||'';
+    const el=document.createElement('div');
+    el.className='file-item pending';
+    el.innerHTML=\`<span class="file-item-icon">\${getFileIcon(ext)}</span>
+      <span class="file-item-name">\${f.name}</span>
+      <span class="file-item-meta">\${fmtSize(f.size)}</span>
+      <span class="file-item-status pending" id="fstatus-\${f.name.replace(/[^a-z0-9]/gi,'_')}"><i class="fas fa-clock"></i></span>\`;
+    fileList.appendChild(el);
+    itemEls.push({el,f,id:f.name.replace(/[^a-z0-9]/gi,'_')});
+  }
+
+  vp.classList.add('show'); bar.style.width='5%';
+  title.textContent=\`Uploading \${files.length} files…\`; chunksEl.innerHTML='';
+  status.textContent='Preparing batch upload…';
+
+  // Send all files at once
+  const form=new FormData();
+  for(const f of files) form.append('files[]',f);
+
+  // Mark all as spinning
+  for(const {el,id} of itemEls){
+    el.className='file-item processing';
+    const s=el.querySelector(\`#fstatus-\${id}\`);
+    if(s){s.className='file-item-status spin';s.innerHTML='<i class="fas fa-sync-alt"></i>';}
+  }
+
+  let prog=5;
+  const totalSize=files.reduce((s,f)=>s+f.size,0);
+  const hasPdf=files.some(f=>f.name.toLowerCase().endsWith('.pdf'));
+  const hasDocx=files.some(f=>/\\.docx?$/i.test(f.name));
+  const pi=setInterval(()=>{
+    prog=Math.min(prog+(hasPdf||hasDocx?3:6),85);
+    bar.style.width=prog+'%';
+    const done=Math.round((prog/85)*files.length);
+    if(prog<40)status.textContent=\`Parsing files (\${done}/\${files.length})…\`;
+    else if(prog<70)status.textContent='Extracting & chunking text…';
+    else status.textContent='Building search index…';
+  },500);
+
+  try{
+    const res=await fetch('/api/upload',{method:'POST',body:form});
+    const data=await res.json();
+    clearInterval(pi);
+    if(data.error)throw new Error(data.error);
+
+    // Update each file item's status
+    for(const {el,f,id} of itemEls){
+      const fr=data.files?.find(r=>r.name===f.name);
+      const statusEl=el.querySelector(\`#fstatus-\${id}\`);
+      if(fr?.ok===false){
+        el.className='file-item err';
+        if(statusEl){statusEl.className='file-item-status err';statusEl.innerHTML='<i class="fas fa-times"></i>';}
+      } else {
+        el.className='file-item ok';
+        if(statusEl){statusEl.className='file-item-status ok';statusEl.innerHTML='<i class="fas fa-check"></i>';}
+      }
+    }
+
+    bar.style.width='100%';
+    searchMode=data.searchMode||'bm25';
+    const modeLabel=searchMode==='vector'?'Vector Embeddings':'BM25 Keyword';
+    title.textContent=\`✅ \${files.length} files ready\`;
+    status.textContent=data.chunks+' chunks · '+(data.chars/1000).toFixed(1)+'K chars · '+modeLabel;
+    renderChunkBadges(chunksEl,data.chunks,searchMode);
+
+    const successCount=data.files?.filter(f=>f.ok!==false).length||files.length;
+    const errCount=data.files?.filter(f=>f.ok===false).length||0;
+    updateLoadedState(
+      \`\${files.length} files\`,
+      \`\${data.chunks} chunks · \${fmtSize(data.totalSize||0)} · \${modeLabel}\`,
+      'multi'
+    );
+    removeIdle();
+    const fileListHtml=data.files?.map(f=>\`<li>\${getFileIcon(f.name?.split('.').pop()||'')} <strong>\${f.name}</strong> — \${fmtSize(f.size||0)}\${f.ok===false?' ❌ '+f.error:' ✅'}</li>\`).join('')||'';
+    addMsg('bot',\`<h4>📦 Batch Upload Complete</h4><p><strong>\${successCount}</strong> of <strong>\${files.length}</strong> files processed · <strong>\${data.chunks} chunks</strong> · \${modeLabel}</p>\${errCount>0?'<p>⚠️ '+errCount+' file(s) failed</p>':''}<ul>\${fileListHtml}</ul><p style="margin-top:8px">You can now ask questions or generate dashboards across all uploaded documents.</p>\`);
+  }catch(err){
+    clearInterval(pi); bar.style.width='0%'; vp.classList.remove('show');
+    for(const {el,id} of itemEls){
+      el.className='file-item err';
+      const s=el.querySelector(\`#fstatus-\${id}\`);
+      if(s){s.className='file-item-status err';s.innerHTML='<i class="fas fa-times"></i>';}
+    }
+    addMsg('bot','<p>❌ Batch upload failed: '+err.message+'</p>');
+  }
+}
+
+/* ── Helpers ──────────────────────────────── */
+function renderChunkBadges(el,total,mode){
+  el.innerHTML='';
+  const me=document.createElement('span'); me.className='vec-chunk';
+  me.style.background=mode==='vector'?'rgba(16,185,129,.1)':'rgba(245,158,11,.1)';
+  me.style.color=mode==='vector'?'#059669':'#b45309';
+  me.textContent=(mode==='vector'?'Vector':'BM25')+' Active';
+  el.appendChild(me);
+  const n=Math.min(total,10);
+  for(let i=0;i<n;i++){const s=document.createElement('span');s.className='vec-chunk';s.textContent='c'+i;el.appendChild(s);}
+  if(total>10){const s=document.createElement('span');s.className='vec-chunk';s.textContent='+'+(total-10);el.appendChild(s);}
+}
+function updateLoadedState(name,meta,type){
+  docLoaded=true; docName=name;
+  const iconEl=document.getElementById('fileLoadedIcon');
+  if(iconEl){
+    const icon=type==='multi'?'fa-layer-group':type==='pdf'?'fa-file-pdf':type==='docx'?'fa-file-word':type==='image'?'fa-image':'fa-file-check';
+    const color=type==='multi'?'#7c3aed':type==='image'?'#0e7490':'#059669';
+    iconEl.style.background=type==='multi'?'rgba(124,58,237,.12)':type==='image'?'rgba(14,116,144,.12)':'rgba(16,185,129,.12)';
+    iconEl.innerHTML=\`<i class="fas \${icon}" style="font-size:15px;color:\${color}"></i>\`;
+  }
+  document.getElementById('fileLoaded').style.display='flex';
+  document.getElementById('loadedName').textContent=name;
+  document.getElementById('loadedMeta').textContent=meta;
+  document.getElementById('uploadZone').classList.add('has-file');
+  document.getElementById('aiCtxText').textContent=name.slice(0,18)+(name.length>18?'…':'');
+}
+
 function clearDoc(){
   docLoaded=false; docName='';
   document.getElementById('fileLoaded').style.display='none';
+  document.getElementById('fileList').style.display='none';
   document.getElementById('vecProgress').classList.remove('show');
   document.getElementById('uploadZone').classList.remove('has-file');
   document.getElementById('aiCtxText').textContent='KB Ready';
-  addMsg('bot','<p>📁 Document removed. Built-in knowledge base still active.</p>');
+  addMsg('bot','<p>📁 Documents removed. Built-in knowledge base still active.</p>');
 }
 
 // ══════════════════════════════════════════════
