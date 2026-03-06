@@ -392,20 +392,20 @@ app.post('/api/kb-add', async (c) => {
               const batch = chunks.slice(i, i + batchSize)
               const embedRes = await llm.embeddings.create({ model: 'text-embedding-3-small', input: batch })
               batch.forEach((text, j) => {
-                kbStore.push({ id: `kb-upload-\${kbFiles.length}-\${i+j}`, text, embedding: embedRes.data[j].embedding, metadata: { source: file.name } })
+                kbStore.push({ id: `kb-upload-${kbFiles.length}-${i+j}`, text, embedding: embedRes.data[j].embedding, metadata: { source: file.name } })
               })
             }
             kbEmbeddingAvailable = true; usedEmbeddings = true
           } catch (e) {
             kbEmbeddingAvailable = false
-            chunks.forEach((text, i) => kbStore.push({ id: `kb-upload-\${kbFiles.length}-\${i}`, text, embedding: null, metadata: { source: file.name } }))
+            chunks.forEach((text, i) => kbStore.push({ id: `kb-upload-${kbFiles.length}-${i}`, text, embedding: null, metadata: { source: file.name } }))
           }
         } else {
-          chunks.forEach((text, i) => kbStore.push({ id: `kb-upload-\${kbFiles.length}-\${i}`, text, embedding: null, metadata: { source: file.name } }))
+          chunks.forEach((text, i) => kbStore.push({ id: `kb-upload-${kbFiles.length}-${i}`, text, embedding: null, metadata: { source: file.name } }))
         }
 
         const fileEntry = {
-          id: `kb-\${Date.now()}-\${Math.random().toString(36).slice(2,7)}`,
+          id: `kb-${Date.now()}-${Math.random().toString(36).slice(2,7)}`,
           name: file.name, size: file.size, fileType: extracted.type,
           chunks: chunks.length, chars: text.length,
           addedAt: new Date().toISOString(), searchMode: usedEmbeddings ? 'vector' : 'bm25'
@@ -453,12 +453,12 @@ app.post('/api/kb-chat', async (c) => {
     for (const r of kbResults) { if (!results.includes(r)) results.push(r) }
     const contextChunks = results.slice(0, 12)
 
-    const contextSource = kbFiles.length > 0 ? `\${kbFiles.length} uploaded file(s)` : 'built-in knowledge base'
+    const contextSource = kbFiles.length > 0 ? `${kbFiles.length} uploaded file(s)` : 'built-in knowledge base'
     const contextBlock = contextChunks.length > 0
       ? `
 
-<context source="\${contextSource}">
-\${contextChunks.join('\n---\n')}
+<context source="${contextSource}">
+${contextChunks.join('\n---\n')}
 </context>`
       : ''
 
@@ -471,7 +471,7 @@ When answering:
 - Be concise and data-driven - cite specific numbers, percentages, dates, and facts
 - If data is from the document/KB, present it confidently`
 
-    const userMsg = contextBlock ? `\${message}\${contextBlock}` : message
+    const userMsg = contextBlock ? `${message}${contextBlock}` : message
 
     const { readable, writable } = new TransformStream()
     const writer = writable.getWriter()
@@ -486,13 +486,13 @@ When answering:
         })
         for await (const chunk of stream) {
           const t = chunk.choices[0]?.delta?.content || ''
-          if (t) await writer.write(enc.encode(`data: \${JSON.stringify({ text: t })}\n\n`))
+          if (t) await writer.write(enc.encode(`data: ${JSON.stringify({ text: t })}\n\n`))
         }
         await writer.write(enc.encode('data: [DONE]\n\n'))
       } catch (err) {
         const fallbackReply = getFallbackReply(message, contextChunks)
         for (const chunk of fallbackReply.match(/.{1,50}/g) || []) {
-          await writer.write(enc.encode(`data: \${JSON.stringify({ text: chunk })}\n\n`))
+          await writer.write(enc.encode(`data: ${JSON.stringify({ text: chunk })}\n\n`))
           await new Promise(r => setTimeout(r, 30))
         }
         await writer.write(enc.encode('data: [DONE]\n\n'))
@@ -517,14 +517,14 @@ app.post('/api/dash-chat', async (c) => {
     const dashContext = dashHtml ? `
 
 <dashboard_content>
-\${dashHtml.slice(0, 8000)}
+${dashHtml.slice(0, 8000)}
 </dashboard_content>` : ''
     const contextChunks = await retrieveContext(message, 6)
     const contextBlock = contextChunks.length > 0
       ? `
 
 <knowledge_base>
-\${contextChunks.join('\n---\n')}
+${contextChunks.join('\n---\n')}
 </knowledge_base>`
       : ''
 
@@ -537,7 +537,7 @@ When answering:
 - Be analytical — interpret trends, flag risks, highlight opportunities
 - Relate dashboard insights to the broader investment thesis`
 
-    const userMsg = `\${message}\${dashContext}\${contextBlock}`
+    const userMsg = `${message}${dashContext}${contextBlock}`
 
     const { readable, writable } = new TransformStream()
     const writer = writable.getWriter()
@@ -552,11 +552,11 @@ When answering:
         })
         for await (const chunk of stream) {
           const t = chunk.choices[0]?.delta?.content || ''
-          if (t) await writer.write(enc.encode(`data: \${JSON.stringify({ text: t })}\n\n`))
+          if (t) await writer.write(enc.encode(`data: ${JSON.stringify({ text: t })}\n\n`))
         }
         await writer.write(enc.encode('data: [DONE]\n\n'))
       } catch (err) {
-        await writer.write(enc.encode(`data: \${JSON.stringify({ text: '<p>AI temporarily unavailable. Please check the dashboard data directly.</p>' })}\n\n`))
+        await writer.write(enc.encode(`data: ${JSON.stringify({ text: '<p>AI temporarily unavailable. Please check the dashboard data directly.</p>' })}\n\n`))
         await writer.write(enc.encode('data: [DONE]\n\n'))
       } finally { await writer.close() }
     }
