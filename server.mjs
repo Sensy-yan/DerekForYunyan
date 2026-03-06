@@ -85,6 +85,34 @@ loadConfig()
 const MODEL = 'gpt-5'
 let llm = new OpenAI({ apiKey, baseURL })
 
+// ─────────────────────────────────────────────
+// Load Dashboard Generation Context Files
+// ─────────────────────────────────────────────
+function loadDashboardContextFiles() {
+  const roleFile = path.join(__dirname, 'generateDerekDashboardRole.md')
+  const skillsFile = path.join(__dirname, 'generateDerekDashboardSkills.md')
+  let role = '', skills = ''
+  try {
+    if (fs.existsSync(roleFile)) {
+      role = fs.readFileSync(roleFile, 'utf8')
+      console.log(`[init] Loaded generateDerekDashboardRole.md (${role.length} chars)`)
+    } else {
+      console.warn('[init] generateDerekDashboardRole.md not found')
+    }
+  } catch (e) { console.warn('[init] Failed to load Role md:', e.message) }
+  try {
+    if (fs.existsSync(skillsFile)) {
+      skills = fs.readFileSync(skillsFile, 'utf8')
+      console.log(`[init] Loaded generateDerekDashboardSkills.md (${skills.length} chars)`)
+    } else {
+      console.warn('[init] generateDerekDashboardSkills.md not found')
+    }
+  } catch (e) { console.warn('[init] Failed to load Skills md:', e.message) }
+  return { role, skills }
+}
+
+const { role: DASH_ROLE_MD, skills: DASH_SKILLS_MD } = loadDashboardContextFiles()
+
 console.log(`[init] Derek AI Dashboard | Model: ${MODEL} | Key: ${apiKey.slice(0,8)}...`)
 
 // ─────────────────────────────────────────────
@@ -669,24 +697,25 @@ app.post('/api/generate-dashboard', async (c) => {
       ? `\n\nData source: ${contextSource}\n---\n${contextChunks.join('\n---\n')}`
       : ''
 
+    const roleSection = DASH_ROLE_MD
+      ? `\n\n---\n# DEREK DASHBOARD GENERATION RULES\n\n${DASH_ROLE_MD}\n---`
+      : ''
+    const skillsSection = DASH_SKILLS_MD
+      ? `\n\n---\n# DEREK DASHBOARD GENERATION WORKFLOW\n\n${DASH_SKILLS_MD}\n---`
+      : ''
+
     const systemPrompt = `You are Derek AI, an expert investment intelligence dashboard generator.
-Generate a complete, interactive HTML dashboard section.
+Generate a complete, self-contained HTML dashboard based on the user's request and knowledge base context.
 
-ABSOLUTE REQUIREMENTS:
-1. Output ONLY raw HTML — no markdown, no backtick fences, no explanations outside HTML tags
-2. Use Chart.js (var Chart = already globally available) with unique IDs prefixed "dyn_"
-3. CSS variables available: --bg:#f0f4f8; --white:#fff; --navy:#0c2340; --border:#e2e8f0; --cyan:#06b6d4; --cdark:#0e7490; --green:#10b981; --amber:#f59e0b; --red:#ef4444; --blue:#3b82f6; --purple:#8b5cf6;
-4. Card style: background:white; border-radius:16px; border:1px solid #e2e8f0; padding:20px; box-shadow:0 2px 10px rgba(0,0,0,.06);
-5. Font: Inter (loaded). Numbers: font-family:'JetBrains Mono',monospace
-6. Required sections: gradient header card, KPI metrics grid (3-4 cards), at least 1 Chart.js chart, data table
-7. Extract REAL data from context — no fake numbers
-8. All Chart.js code in <script> wrapped in setTimeout(()=>{...},150)
-9. KPI card style: background:linear-gradient(135deg,#0c2340,#0e4a6e); color:white; padding:16px; border-radius:12px;
-10. Status badges: green=positive, amber=caution, red=risk
+CRITICAL OUTPUT RULES:
+1. Output ONLY raw HTML — no markdown fences, no backtick blocks, no explanation text outside HTML
+2. Chart.js is globally available (already loaded on page) — use unique canvas IDs prefixed "dyn_"
+3. Wrap ALL Chart.js initialization in setTimeout(()=>{...}, 150)
+4. The HTML will be injected directly into a div — do NOT include <html>/<head>/<body> wrapper tags
+5. Extract REAL data from the provided knowledge base context — do not fabricate numbers
+6. Use Inter font (loaded) for text, JetBrains Mono for all numeric values${roleSection}${skillsSection}`
 
-The output will be directly injected into a div — make it a complete, self-contained dashboard.`
-
-    const userMsg = `Create a professional investment dashboard for: "${prompt}"${contextBlock}`
+    const userMsg = `Generate a Derek investment dashboard for: "${prompt}"${contextBlock}`
 
     const { readable, writable } = new TransformStream()
     const writer = writable.getWriter()
