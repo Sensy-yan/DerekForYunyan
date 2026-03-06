@@ -12,6 +12,51 @@ import path from 'path'
 import os from 'os'
 import yaml from 'js-yaml'
 import { fileURLToPath } from 'url'
+import { createRequire } from 'module'
+
+const require = createRequire(import.meta.url)
+
+// Lazy-load PDF and DOCX parsers
+let _mammoth = null
+async function getMammoth() {
+  if (!_mammoth) {
+    const mod = await import('mammoth')
+    _mammoth = mod.default || mod
+  }
+  return _mammoth
+}
+
+let _pdfjsLib = null
+function getPdfjsLib() {
+  if (!_pdfjsLib) {
+    _pdfjsLib = require('pdfjs-dist/build/pdf.js')
+    _pdfjsLib.GlobalWorkerOptions.workerSrc = ''
+  }
+  return _pdfjsLib
+}
+
+// PDF parse using pdfjs-dist (no worker, server-side)
+async function parsePDF(buffer) {
+  try {
+    const pdfjsLib = getPdfjsLib()
+    const uint8 = new Uint8Array(buffer)
+    const doc = await pdfjsLib.getDocument({ 
+      data: uint8, 
+      useWorkerFetch: false, 
+      isEvalSupported: false,
+      useSystemFonts: true
+    }).promise
+    let text = ''
+    for (let i = 1; i <= doc.numPages; i++) {
+      const page = await doc.getPage(i)
+      const content = await page.getTextContent()
+      text += content.items.map(item => item.str).join(' ') + '\n'
+    }
+    return { text: text.trim(), numpages: doc.numPages }
+  } catch(e) {
+    throw new Error('PDF parsing failed: ' + e.message)
+  }
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -161,6 +206,74 @@ const app = new Hono()
 app.use('/api/*', cors())
 
 // ── Upload & vectorize ────────────────────────
+// ── Text extraction helpers ───────────────────
+async function extractTextFromFile(file) {
+  const name = file.name.toLowerCase()
+  const ext = name.split('.').pop()
+
+  // PDF
+  if (ext === 'pdf') {
+    const buffer = Buffer.from(await file.arrayBuffer())
+    try {
+      const data = await parsePDF(buffer)
+      return { text: data.text, type: 'pdf', pageCount: data.numpages }
+    } catch (e) {
+      throw new Error('Failed to parse PDF: ' + e.message)
+    }
+  }
+  // DOCX
+  if (ext === 'docx' || ext === 'doc') {
+    const buffer = Buffer.from(await file.arrayBuffer())
+    try {
+      const mammoth = await getMammoth()
+      const result = await mammoth.extractRawText({ buffer })
+      return { text: result.value, type: 'docx', warnings: result.messages?.length || 0 }
+    } catch (e) {
+      throw new Error('Failed to parse DOCX: ' + e.message)
+    }
+  }
+
+  // Images (JPG, PNG, GIF, WEBP, BMP, etc.)
+  if (['jpg','jpeg','png','gif','webp','bmp','tiff','svg'].includes(ext)) {
+    // Use LLM vision to describe image if available, otherwise return placeholder
+    const buffer = Buffer.from(await file.arrayBuffer())
+    const base64 = buffer.toString('base64')
+    const mimeMap = { jpg:'image/jpeg', jpeg:'image/jpeg', png:'image/png', gif:'image/gif', webp:'image/webp', bmp:'image/bmp', tiff:'image/tiff', svg:'image/svg+xml' }
+    const mime = mimeMap[ext] || 'image/jpeg'
+    const dataUrl = `data:${mime};base64,${base64}`
+
+    // Try vision API
+    try {
+      const visionRes = await llm.chat.completions.create({
+        model: MODEL,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Please analyze this image in detail. Describe all text, numbers, charts, tables, figures, and key information visible in the image. Focus on extractable data for financial analysis.' },
+            { type: 'image_url', image_url: { url: dataUrl } }
+          ]
+        }],
+        max_tokens: 2048
+      })
+      const description = visionRes.choices[0]?.message?.content || ''
+      return { text: `[Image: ${file.name}]\n${description}`, type: 'image', width: null, height: null }
+    } catch (e) {
+      // Vision API failed, return basic metadata
+      return { text: `[Image file: ${file.name} — ${Math.round(file.size/1024)}KB. Image content analysis unavailable. Please ensure your API key supports vision capabilities.]`, type: 'image', error: e.message }
+    }
+  }
+
+  // HTML
+  if (ext === 'html' || ext === 'htm') {
+    const raw = await file.text()
+    return { text: stripHtml(raw), type: 'html' }
+  }
+
+  // Plain text, markdown, CSV, JSON
+  const raw = await file.text()
+  return { text: raw, type: ext }
+}
+
 app.post('/api/upload', async (c) => {
   try {
     const form = await c.req.formData()
@@ -168,8 +281,15 @@ app.post('/api/upload', async (c) => {
     if (!file) return c.json({ error: 'No file' }, 400)
 
     const name = file.name
-    const raw = await file.text()
-    const plainText = (name.endsWith('.html') || name.endsWith('.htm')) ? stripHtml(raw) : raw
+    const ext = name.split('.').pop()?.toLowerCase() || ''
+    const supportedExts = ['html','htm','txt','md','csv','json','pdf','doc','docx','jpg','jpeg','png','gif','webp','bmp','tiff','svg']
+    if (!supportedExts.includes(ext)) {
+      return c.json({ error: `Unsupported file type: .${ext}. Supported: ${supportedExts.join(', ')}` }, 400)
+    }
+
+    // Extract text based on file type
+    const extracted = await extractTextFromFile(file)
+    const plainText = extracted.text
     const truncated = plainText.slice(0, 80000)
 
     vectorStore = []
@@ -202,6 +322,7 @@ app.post('/api/upload', async (c) => {
     return c.json({
       name, size: file.size, chunks: vectorStore.length,
       chars: truncated.length,
+      fileType: extracted.type,
       searchMode: usedEmbeddings ? 'vector' : 'bm25'
     })
   } catch (err) {
@@ -661,17 +782,20 @@ html,body{height:100%;overflow:hidden;font-family:'Inter',sans-serif;background:
     ondragleave="this.classList.remove('drag')"
     ondrop="handleDrop(event)">
     <input type="file" class="upload-input" id="fileInput"
-      accept=".html,.htm,.txt,.md,.csv,.json"
+      accept=".html,.htm,.txt,.md,.csv,.json,.pdf,.doc,.docx,.jpg,.jpeg,.png,.gif,.webp,.bmp"
       onchange="handleFileChange(event)"/>
     <div class="upload-icon"><i class="fas fa-cloud-upload-alt"></i></div>
     <div class="upload-title">Upload Deal Memo or Document</div>
-    <div class="upload-sub">Drag & drop or click to select.<br>Automatically processed for semantic search and AI dashboard generation.</div>
+    <div class="upload-sub">Drag & drop or click to select.<br>Supports PDF, DOCX, images, HTML, TXT, CSV, JSON — all automatically processed for AI analysis.</div>
     <div class="upload-types">
+      <span class="upload-type">.pdf</span>
+      <span class="upload-type">.docx</span>
       <span class="upload-type">.html</span>
       <span class="upload-type">.txt</span>
       <span class="upload-type">.md</span>
       <span class="upload-type">.csv</span>
       <span class="upload-type">.json</span>
+      <span class="upload-type">.jpg / .png</span>
     </div>
   </div>
   <div class="file-loaded" id="fileLoaded" style="display:none">
@@ -748,7 +872,7 @@ html,body{height:100%;overflow:hidden;font-family:'Inter',sans-serif;background:
     <div class="ai-idle" id="aiIdle">
       <div class="ai-idle-icon"><i class="fas fa-robot"></i></div>
       <h3>Derek AI · RAG Intelligence</h3>
-      <p>Built-in Shoreless Inc. knowledge base is active. Upload a document for additional context.</p>
+      <p>Built-in Shoreless Inc. knowledge base is active. Upload a document (PDF, DOCX, images, HTML, TXT…) for additional context.</p>
       <div class="tip-list">
         <div class="tip-item" onclick="useTip(this)"><span class="tip-em">📊</span><span class="tip-txt">Generate a financial dashboard with revenue charts</span></div>
         <div class="tip-item" onclick="useTip(this)"><span class="tip-em">🔍</span><span class="tip-txt">What are the key investment risks?</span></div>
@@ -847,9 +971,9 @@ function handleFileChange(e){
 }
 
 async function processFile(file){
-  const allowed=['html','htm','txt','md','csv','json'];
+  const allowed=['html','htm','txt','md','csv','json','pdf','doc','docx','jpg','jpeg','png','gif','webp','bmp'];
   const ext=file.name.split('.').pop()?.toLowerCase()||'';
-  if(!allowed.includes(ext)){addMsg('bot','<p>⚠️ Unsupported: <strong>.'+ext+'</strong></p>');return;}
+  if(!allowed.includes(ext)){addMsg('bot','<p>⚠️ Unsupported: <strong>.'+ext+'</strong><br>Supported formats: PDF, DOCX, HTML, TXT, MD, CSV, JSON, Images (JPG/PNG/GIF/WEBP)</p>');return;}
 
   const vp=document.getElementById('vecProgress');
   const bar=document.getElementById('vecBar');
@@ -858,16 +982,24 @@ async function processFile(file){
   const chunksEl=document.getElementById('vecChunks');
 
   vp.classList.add('show'); bar.style.width='10%';
+  
+  // File-type specific messages
+  const isImage=['jpg','jpeg','png','gif','webp','bmp'].includes(ext);
+  const isPdf=ext==='pdf';
+  const isDocx=['doc','docx'].includes(ext);
+  
   title.textContent='Processing '+file.name+'…';
-  status.textContent='Uploading…'; chunksEl.innerHTML='';
+  status.textContent=isPdf?'Parsing PDF…':isDocx?'Extracting DOCX…':isImage?'Analyzing image with AI…':'Uploading…';
+  chunksEl.innerHTML='';
 
   const form=new FormData(); form.append('file',file);
   let prog=10;
-  const pi=setInterval(()=>{prog=Math.min(prog+7,85);bar.style.width=prog+'%';
-    if(prog<40)status.textContent='Extracting text…';
-    else if(prog<70)status.textContent='Chunking & indexing…';
+  const pi=setInterval(()=>{prog=Math.min(prog+5,85);bar.style.width=prog+'%';
+    if(prog<30)status.textContent=isPdf?'Parsing PDF pages…':isDocx?'Parsing DOCX content…':isImage?'Sending to vision AI…':'Uploading…';
+    else if(prog<55)status.textContent='Extracting text & structure…';
+    else if(prog<75)status.textContent='Chunking & indexing…';
     else status.textContent='Building search index…';
-  },400);
+  },isPdf||isDocx||isImage?600:400);
 
   try{
     const res=await fetch('/api/upload',{method:'POST',body:form});
@@ -898,7 +1030,9 @@ async function processFile(file){
     document.getElementById('aiCtxText').textContent=data.name.slice(0,18)+(data.name.length>18?'…':'');
 
     removeIdle();
-    addMsg('bot',\`<h4>📁 Document Ready: \${data.name}</h4><p>Processed <strong>\${data.chunks} chunks</strong> using \${modeLabel}.</p><ul><li><strong>Ask questions</strong> — AI searches relevant passages</li><li><strong>Generate dashboards</strong> — enter a prompt on the left</li><li><strong>Quick chips</strong> — click Overview, Financials, etc.</li></ul>\`);
+    const ftIcon=data.fileType==='pdf'?'📄':data.fileType==='docx'?'📝':data.fileType==='image'?'🖼️':'📁';
+    const ftNote=data.fileType==='image'?'<li><strong>Image analyzed</strong> — AI vision extracted content & text</li>':data.fileType==='pdf'?'<li><strong>PDF parsed</strong> — text extracted from all pages</li>':data.fileType==='docx'?'<li><strong>DOCX parsed</strong> — document content extracted</li>':'';
+    addMsg('bot',\`<h4>\${ftIcon} Document Ready: \${data.name}</h4><p>Processed <strong>\${data.chunks} chunks</strong> using \${modeLabel}.</p><ul>\${ftNote}<li><strong>Ask questions</strong> — AI searches relevant passages</li><li><strong>Generate dashboards</strong> — enter a prompt on the left</li><li><strong>Quick chips</strong> — click Overview, Financials, etc.</li></ul>\`);
   }catch(err){
     clearInterval(pi); bar.style.width='0%'; vp.classList.remove('show');
     addMsg('bot','<p>❌ Failed: '+err.message+'</p>');
